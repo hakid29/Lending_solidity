@@ -1,10 +1,10 @@
 
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity 0.8.13;
+pragma solidity ^0.8.13;
 
 import "forge-std/Test.sol";
 
-import {ERC20} from "openzeppelin-contracts/token/ERC20/ERC20.sol";
+import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 import "src/UpsideAcademyLending.sol";
 
 contract CUSDC is ERC20 {
@@ -253,7 +253,7 @@ contract Testx is Test {
         }
         vm.stopPrank();
     }
-
+// 1
     function testBorrowWithInSufficientCollateralAfterRepaymentFails() external {
         supplyUSDCDepositUser1();
         supplySmallEtherDepositUser2();
@@ -402,7 +402,7 @@ contract Testx is Test {
         }
         vm.stopPrank();
     }
-
+// 2
     function testWithdrawLockedCollateralAfterInterestAccuredFails() external {
         supplyUSDCDepositUser1();
         supplySmallEtherDepositUser2();
@@ -431,7 +431,7 @@ contract Testx is Test {
         }
         vm.stopPrank();
     }
-
+// 3
     function testWithdrawYieldSucceeds() external {
         usdc.transfer(user3, 30000000 ether);
         vm.startPrank(user3);
@@ -482,7 +482,7 @@ contract Testx is Test {
 
         assertTrue(lending.getAccruedSupplyAmount(address(usdc)) / 1e18 == 0);
     }
-
+// 4
     function testExchangeRateChangeAfterUserBorrows() external {
         usdc.transfer(user3, 30000000 ether);
         vm.startPrank(user3);
@@ -562,7 +562,7 @@ contract Testx is Test {
         }
         vm.stopPrank();
     }
-
+// liquidate함수
     function testLiquidationHealthyLoanFails() external {
         supplyUSDCDepositUser1();
         supplySmallEtherDepositUser2();
