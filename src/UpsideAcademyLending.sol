@@ -9,30 +9,32 @@ pragma solidity ^0.8.13;
 // - 주요 기능 인터페이스는 아래를 참고해 만드시면 됩니다.
 
 import "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
-//import {UpsideOracle} from "test/LendingTest.t.sol";
+import "forge-std/Test.sol";
 
 interface IPriceOracle {
     function getPrice(address token) external view returns (uint256);
 }
 
 contract UpsideAcademyLending {
+    struct User {
+        uint256 etherDeposit;
+        uint256 usdcDeposit;
+        uint256 usdcBorrow;
+        uint256 lastUpdate;
+        uint256 updatedTotalDebt;
+    }
+
+    User[] Users;
+    uint256 userCount;
     IPriceOracle public priceOracle;
     address public usdc;
     uint256 public totalUSDCDeposits;
-    uint256 public totalEtherDeposits;
-    uint256 public reserve;
+    uint256 public totalDebt;
 
-    mapping(address => uint256) public etherDeposits;
-    mapping(address => uint256) public usdcDeposits;
-    mapping(address => uint256) public usdcBorrows;
+    mapping(address => uint256) matchUserId;
 
-    uint256 public constant LOAN_TO_VALUE = 50; // 50%
-    uint256 public constant LIQUIDATION_THRESHOLD = 75;
-    uint256 public constant LIQUIDATION_BONUS = 10; // 10%
-
-    uint256 public constant block_interest = 100063995047075019; // 100.06xxxx * 10^77
-    uint256 public constant day_interest = 100100000000000000; // 100.1 * 10^77
-    uint256 public constant denominator = 1e77;
+    uint256 public constant blockInterest = 100000013881950033; // (1.001의 7200제곱근) * 10^17
+    uint256 public constant dayInterest = 100100000000000000; // 100.1 * 10^17
 
     constructor(IPriceOracle _priceOracle, address _usdc) {
         priceOracle = _priceOracle;
@@ -41,20 +43,85 @@ contract UpsideAcademyLending {
 
     function initializeLendingProtocol(address token) external payable {
         require(msg.value > 0, "Must send ether to initialize");
-        reserve = msg.value;
-        ERC20(usdc).transferFrom(msg.sender, address(this), msg.value); // ?
+        ERC20(usdc).transferFrom(msg.sender, address(this), msg.value);
+    }
+
+    function updateBorrow(User memory user_, uint256 index) internal {
+        // totaldebt update
+        if (user_.usdcBorrow != 0 && block.number != user_.lastUpdate) {
+            uint usdcBorrow_ = user_.usdcBorrow;
+            uint afterblock = block.number - user_.lastUpdate;
+
+            uint day = afterblock / 7200; // 1 day = 7200 block
+            uint withinday = afterblock % 7200;
+
+            // 최적화
+            uint dayInterest_ = dayInterest;
+            uint blockInterest_ = blockInterest;
+
+            assembly {
+                for { let i := 0 } lt(i, day) { i := add(i, 1) } {
+                    usdcBorrow_ := div(mul(usdcBorrow_, dayInterest_), 100000000000000000)
+                }
+
+                for { let j := 0 } lt(j, withinday) { j := add(j, 1) } {
+                    usdcBorrow_ := div(mul(usdcBorrow_, blockInterest_), 100000000000000000)
+                }
+            }
+
+            // update
+            totalDebt += (usdcBorrow_ - user_.usdcBorrow);
+            user_.usdcBorrow = usdcBorrow_;
+        }
+        user_.lastUpdate = block.number;
+        Users[index] = user_;
+    }
+
+    function updateDeposit(User memory user_, uint256 index) internal {
+        if (user_.usdcDeposit != 0) {
+            user_.usdcDeposit = user_.usdcDeposit + (totalDebt - user_.updatedTotalDebt) * user_.usdcDeposit / totalUSDCDeposits;
+            user_.updatedTotalDebt = totalDebt;
+            Users[index] = user_;
+        }
+    }
+
+    function updateAll() internal {
+        uint oldTotalDebt = totalDebt;
+        for (uint i = 0; i < Users.length; i++) {
+            User memory user_ = Users[i];
+            updateBorrow(user_, i);
+        }
+        if (oldTotalDebt != totalDebt) {
+            for (uint i = 0; i < Users.length; i++) {
+                User memory user_ = Users[i];
+                updateDeposit(user_, i);
+            }
+        }
     }
 
     function deposit(address token, uint256 amount) external payable {
+        // deposit할 때는 update할 필요 없음
+        User memory user_;
+        if (matchUserId[msg.sender] != 0) {
+            user_ = Users[matchUserId[msg.sender]-1];
+        } else { // initialize user
+            matchUserId[msg.sender] = userCount + 1;
+            user_.updatedTotalDebt = totalDebt;
+            user_.lastUpdate = block.number;
+            Users.push(user_);
+            userCount++;
+        }
+
         require(amount > 0, "Amount must be greater than 0");
         if (token == address(0)) { // Ether deposit
             require(msg.value == amount, "Sent ether must equal amount");
-            etherDeposits[msg.sender] += msg.value;
-            totalEtherDeposits += msg.value;
+            user_.etherDeposit += msg.value;
+            Users[matchUserId[msg.sender]-1] = user_;
         } else if (token == usdc) { // USDC deposit
             ERC20(usdc).transferFrom(msg.sender, address(this), amount);
-            usdcDeposits[msg.sender] += amount;
+            user_.usdcDeposit += amount;
             totalUSDCDeposits += amount;
+            Users[matchUserId[msg.sender]-1] = user_;
         } else {
             revert("Unsupported token");
         }
@@ -62,38 +129,53 @@ contract UpsideAcademyLending {
 
     function borrow(address token, uint256 amount) external {
         require(token == usdc, "Only USDC can be borrowed");
+        require(matchUserId[msg.sender] != 0, "Do other thing first");
 
-        uint256 collateralValueInUSDC = (etherDeposits[msg.sender] * priceOracle.getPrice(address(0x00))) / 1 ether;
-        uint256 maxBorrow = (collateralValueInUSDC * LOAN_TO_VALUE) / 100; // 50%
+        updateAll();
+        User memory user_ = Users[matchUserId[msg.sender]-1];
 
-        require(usdcBorrows[msg.sender] + amount <= maxBorrow, "Insufficient collateral");
-        require(amount <= totalUSDCDeposits - reserve, "Insufficient liquidity");
+        uint256 collateralValueInUSDC = (user_.etherDeposit * priceOracle.getPrice(address(0x00))) / 1 ether;
+        uint256 maxBorrow = (collateralValueInUSDC * 50) / 100; // loan to value
 
-        usdcBorrows[msg.sender] += amount;
+        require(user_.usdcBorrow + amount <= maxBorrow, "Insufficient collateral");
+        require(amount <= totalUSDCDeposits, "Insufficient liquidity");
+
         ERC20(usdc).transfer(msg.sender, amount);
+        user_.usdcBorrow += amount;
+        Users[matchUserId[msg.sender]-1] = user_;
     }
 
     function repay(address token, uint256 amount) external {
         require(token == usdc, "Only USDC can be repaid");
+        require(matchUserId[msg.sender] != 0, "Do other thing first");
+
+        updateAll();
 
         ERC20(usdc).transferFrom(msg.sender, address(this), amount);
-        usdcBorrows[msg.sender] -= amount;
+        Users[matchUserId[msg.sender]-1].usdcBorrow -= amount;
     }
 
     function withdraw(address token, uint256 amount) external {
-        if (token == address(0)) { // Ether withdrawal
-            uint256 collateralValueInUSDC = (etherDeposits[msg.sender] * priceOracle.getPrice(address(0))) / 1 ether;
-            uint256 borrowedAmount = usdcBorrows[msg.sender];
-            require((collateralValueInUSDC - ((priceOracle.getPrice(address(0)) * amount) / 1 ether)) * LIQUIDATION_THRESHOLD / 100 >= borrowedAmount, "Collateral is locked");
+        require(matchUserId[msg.sender] != 0, "Do other thing first");
 
-            etherDeposits[msg.sender] -= amount;
-            totalEtherDeposits -= amount;
+        updateAll();
+        User memory user_ = Users[matchUserId[msg.sender]-1];
+
+        if (token == address(0)) { // Ether withdrawal
+            uint256 collateralValueInUSDC = (user_.etherDeposit * priceOracle.getPrice(address(0))) / 1 ether;
+            uint256 borrowedAmount = user_.usdcBorrow;
+            require((collateralValueInUSDC - ((priceOracle.getPrice(address(0)) * amount) / 1 ether)) * 75 / 100 >= borrowedAmount, "Collateral is locked");
+
             payable(msg.sender).transfer(amount);
+            user_.etherDeposit -= amount;
+            Users[matchUserId[msg.sender]-1] = user_;
         } else if (token == usdc) { // USDC withdrawal
-            require(usdcDeposits[msg.sender] >= amount, "Insufficient balance");
-            usdcDeposits[msg.sender] -= amount;
-            totalUSDCDeposits -= amount;
+            require(user_.usdcDeposit >= amount, "Insufficient balance");
+
             ERC20(usdc).transfer(msg.sender, amount);
+            totalUSDCDeposits -= amount;
+            user_.usdcDeposit -= amount;
+            Users[matchUserId[msg.sender]-1] = user_;
         } else {
             revert("Unsupported token");
         }
@@ -102,26 +184,32 @@ contract UpsideAcademyLending {
     function liquidate(address borrower, address token, uint256 amount) external {
         require(token == usdc, "Only USDC can be used for liquidation");
 
-        uint256 collateralValueInUSDC = (etherDeposits[borrower] * priceOracle.getPrice(address(0))) / 1 ether;
-        uint256 borrowedAmount = usdcBorrows[borrower];
+        updateAll();
+        User memory user_ = Users[matchUserId[borrower]-1];
+
+        uint256 collateralValueInUSDC = (user_.etherDeposit * priceOracle.getPrice(address(0))) / 1 ether;
+        uint256 borrowedAmount = user_.usdcBorrow;
         uint256 amount_ = amount * 1e18 / priceOracle.getPrice(address(usdc));
 
-        require(collateralValueInUSDC < (borrowedAmount * 100) / LIQUIDATION_THRESHOLD, "Loan is not eligible for liquidation");
+        require(collateralValueInUSDC < (borrowedAmount * 100) / 75, "Loan is not eligible for liquidation");
         require((amount_ == borrowedAmount && borrowedAmount < 100 ether) || (amount_ <= borrowedAmount * 1 / 4), "Invalid amount");
 
         ERC20(usdc).transferFrom(msg.sender, address(this), amount);
-        usdcBorrows[borrower] -= amount_;
-        etherDeposits[borrower] -= (amount_ * 1 ether) / priceOracle.getPrice(address(0));
+        user_.usdcBorrow -= amount_;
+        user_.etherDeposit -= (amount_ * 1 ether) / priceOracle.getPrice(address(0));
+        Users[matchUserId[borrower]-1] = user_;
 
-        totalEtherDeposits -= (amount_ * 1 ether) / priceOracle.getPrice(address(0));
         payable(msg.sender).transfer((amount_ * 1 ether) / priceOracle.getPrice(address(0)));
     }
 
-    function getAccruedSupplyAmount(address token) external view returns (uint256) {
-        if (token == usdc) {
-            return totalUSDCDeposits + (totalEtherDeposits * priceOracle.getPrice(address(0))) / 1 ether - reserve;
-        } else {
-            revert("Unsupported token");
+    function getAccruedSupplyAmount(address token) external returns (uint256) {
+        require(token == usdc, "Invalid token");
+        if (matchUserId[msg.sender] == 0) {
+            return 0;
         }
+
+        updateAll();
+        User memory user_ = Users[matchUserId[msg.sender]-1];
+        return Users[matchUserId[msg.sender]-1].usdcDeposit;
     }
 }

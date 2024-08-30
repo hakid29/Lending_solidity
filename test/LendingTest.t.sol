@@ -562,7 +562,7 @@ contract Testx is Test {
         }
         vm.stopPrank();
     }
-// liquidate함수
+
     function testLiquidationHealthyLoanFails() external {
         supplyUSDCDepositUser1();
         supplySmallEtherDepositUser2();
